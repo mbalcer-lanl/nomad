@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -24,6 +25,7 @@ from .logging_utils import configure_root_logging, parse_log_level
 from .model_cards import ModelCardLocator, register_model_card_tool
 from .otel import configure_otel, shutdown_otel
 from .task_extension import NomadTasksExtension
+from .torch_tool_manager import TorchModelToolManager
 from .tool_search import register_search_tool
 
 LogLevelName = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -77,56 +79,225 @@ def _format_visible_devices(manager: Any) -> str:
     return "none"
 
 
-def run_code_mode_script(
+def _register_tools(
+    config: ServerConfig,
+    server: FastMCP,
+    manager: "TorchModelToolManager | None",
+    card_locator: ModelCardLocator,
+    strict: bool,
+    context_dir: Path,
+) -> set[str]:
+    """Register all tools from config. Returns set of registered tool names."""
+    registered = set()
+
+    # Register regular tools
+    for tool in config.tools:
+        tool.add_to_fastmcp(server)
+        registered.add(tool.name)
+
+    # Register model tools
+    for fm_config in config.fmod_models:
+        fm_name = fm_config.tool_name or fm_config.name_or_path
+        try:
+            tool = config.build_tool(fm_config)
+            source = fm_config.resolve_source(base_dir=context_dir)
+
+            LOGGER.info("Registering torch model '%s'", fm_name)
+
+            if manager:
+                manager.register_tool(tool.name, tool, source=source)
+            else:
+                add_torch_module_tool_to_fastmcp(server, tool)
+
+            card_locator.register(tool.name or fm_config.name_or_path, source)
+            registered.add(tool.name)
+        except Exception:
+            LOGGER.exception("Failed to load torch model: `%s`", fm_name)
+            if strict:
+                raise
+
+    if manager:
+        manager.add_to_fastmcp(server)
+
+    return registered
+
+
+def _unregister_tools(
+    server: FastMCP,
+    manager: "TorchModelToolManager | None",
+    card_locator: ModelCardLocator,
+    tool_names: set[str],
+) -> None:
+    """Unregister tools by name."""
+    for name in tool_names:
+        try:
+            server.remove_tool(name)
+            LOGGER.info("Unregistered tool '%s'", name)
+        except Exception:
+            LOGGER.exception("Failed to unregister tool '%s'", name)
+
+    if manager:
+        # Remove from manager's internal state
+        for name in tool_names:
+            if name in manager._tools:
+                state = manager._tools.pop(name)
+                manager._inflight_by_tool.pop(name, None)
+                # Offload and clean up
+                for slot_idx in list(state.loaded_slots):
+                    if slot_idx < len(manager._device_slots):
+                        slot = manager._device_slots[slot_idx]
+                        if slot.current_tool == name:
+                            slot.current_tool = None
+                            slot.tool = None
+                            slot.busy = False
+                LOGGER.info("Removed tool '%s' from manager", name)
+
+    # Unregister model cards
+    for name in tool_names:
+        card_locator.unregister(name)
+
+
+async def _watch_config(
+    config_path: Path,
+    server: FastMCP,
+    manager_ref: list["TorchModelToolManager | None"],
+    card_locator: ModelCardLocator,
+    use_tool_manager: bool,
+    strict: bool,
+    interval: float,
+) -> None:
+    """Watch config file for changes and hot-swap tools."""
+    # Load initial config for diffing
+    current_config = ServerConfig.from_file(config_path)
+    last_mtime = config_path.stat().st_mtime
+    LOGGER.info("Watching config file for changes (interval: %.1fs)", interval)
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            current_mtime = config_path.stat().st_mtime
+        except FileNotFoundError:
+            LOGGER.warning("Config file not found: %s", config_path)
+            continue
+
+        if current_mtime <= last_mtime:
+            continue
+
+        last_mtime = current_mtime
+        LOGGER.info("Config file changed, reloading...")
+
+        try:
+            new_config = ServerConfig.from_file(config_path)
+        except ConfigError as exc:
+            LOGGER.error("Failed to load new config: %s", exc)
+            continue
+        except Exception as exc:
+            LOGGER.exception("Unexpected error loading config")
+            continue
+
+        manager = manager_ref[0]
+
+        # Recreate manager if tool_manager config changed
+        manager_cfg = new_config.tool_manager
+        new_use_manager = use_tool_manager and manager_cfg.enabled
+
+        if new_use_manager != (manager is not None) or (manager is not None and manager_cfg != current_config.tool_manager):
+            LOGGER.info("Tool manager config changed, recreating manager")
+            if manager:
+                await manager.aclose()
+            manager = manager_cfg.instantiate() if new_use_manager else None
+            manager_ref[0] = manager
+            LOGGER.info("Visible devices: %s", _format_visible_devices(manager))
+
+        # Compute diff
+        old_tools = set()
+        for tool in current_config.tools:
+            old_tools.add(tool.name)
+        for fm in current_config.fmod_models:
+            old_tools.add(fm.tool_name or fm.name_or_path)
+
+        new_tools = set()
+        for tool in new_config.tools:
+            new_tools.add(tool.name)
+        for fm in new_config.fmod_models:
+            new_tools.add(fm.tool_name or fm.name_or_path)
+
+        removed = old_tools - new_tools
+        added = new_tools - old_tools
+
+        if removed:
+            LOGGER.info("Removing tools: %s", removed)
+            _unregister_tools(server, manager, card_locator, removed)
+
+        if added:
+            LOGGER.info("Adding tools: %s", added)
+            _register_tools(new_config, server, manager, card_locator, strict, new_config.context_dir)
+
+        # Update search tool if config changed
+        if new_config.search_tool.expose != current_config.search_tool.expose:
+            if new_config.search_tool.expose:
+                register_search_tool(server, search_config=new_config.search_tool)
+            else:
+                try:
+                    server.remove_tool("search_tools")
+                except Exception:
+                    pass
+
+        current_config = new_config  # Update reference for next iteration
+        LOGGER.info("Config reload complete")
+
+
+
+
+
+async def run_code_mode_script(
     config_path: Path,
     script_path: Path,
-    gateway_log_level: str,
-    directory: Path = Path.cwd(),
-    script_args: Sequence[str] = (),
+    gateway_log_level: str = "WARNING",
+    directory: Path | None = None,
+    script_args: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Execute a Python script inside the code-mode gateway sandbox."""
+    """Run a script through the code-mode gateway without starting a long-lived server."""
+    from .gateway.server import run_gateway
+    import asyncio
+    import logging
 
-    gateway_cli._configure_logging(gateway_log_level)
-    try:
-        gateway_config = GatewayConfig.from_file(config_path)
-    except ConfigError as exc:
-        raise typer.BadParameter(
-            f"Failed to load gateway config '{config_path}': {exc}"
-        ) from exc
-    gateway_config.defaults.workspace_root = directory
-    gateway_telemetry = getattr(gateway_config, "telemetry", None)
-    configure_otel(
-        service_name=getattr(gateway_telemetry, "service_name", "nomad-gateway"),
-        service_version=_PACKAGE_VERSION,
-        enabled=getattr(gateway_telemetry, "enabled", None),
-        otlp_endpoint=getattr(gateway_telemetry, "otlp_endpoint", None),
-    )
+    script_path = script_path.expanduser().resolve()
+    config_path = config_path.expanduser().resolve()
 
-    async def _execute() -> dict[str, Any]:
-        async with CodeModeGateway(gateway_config) as gateway:
-            result = await gateway.run_script(
-                script_path,
-                script_args=script_args,
-                timeout_seconds=None,
-                capture_stdio=False,
-            )
-            payload = asdict(result)
-            payload.pop("stdout", None)
-            payload.pop("stderr", None)
-            return payload
+    # Configure logging for the gateway
+    numeric_level = parse_log_level(gateway_log_level)
+    configure_root_logging(stderr_level=numeric_level)
+
+    # Load gateway config
+    gateway_config = GatewayConfig.from_file(config_path)
+
+    # Override workspace_root if directory is specified
+    if directory is not None:
+        gateway_config.defaults.workspace_root = directory.expanduser().resolve()
+
+    # Create gateway instance
+    gateway = CodeModeGateway(gateway_config)
+
+    # Start upstream connections
+    await gateway._upstream.start()
 
     try:
-        return asyncio.run(_execute())
-    except UpstreamConnectionError as exc:
-        raise click.ClickException(str(exc)) from exc
-    except TimeoutError:
-        return {
-            "result": {"error": "timeout"},
-            "tool_calls": [],
-        }
+        # Run the script
+        result = await gateway.run_script(
+            script_path=script_path,
+            env=None,
+            script_args=script_args or [],
+            capture_stdio=True,
+        )
+        # Convert SandboxResult to dict
+        from dataclasses import asdict
+        return asdict(result)
     finally:
+        # Clean up
+        await gateway._upstream.stop()
+        await gateway._sandbox.aclose()
         shutdown_otel()
-
 
 @app.command(
     short_help="Serve Nomad tools over stdio or HTTP.",
@@ -195,6 +366,22 @@ def serve(
             envvar="NOMAD_SERVE_STRICT",
         ),
     ] = True,
+    watch: Annotated[
+        bool,
+        typer.Option(
+            "--watch/--no-watch",
+            help="Watch config file for changes and hot-swap tools.",
+            envvar="NOMAD_SERVE_WATCH",
+        ),
+    ] = False,
+    watch_interval: Annotated[
+        float,
+        typer.Option(
+            "--watch-interval",
+            help="Config file poll interval in seconds.",
+            envvar="NOMAD_SERVE_WATCH_INTERVAL",
+        ),
+    ] = 2.0,
 ):
     """Start a Nomad MCP server from a config file.
 
@@ -203,21 +390,7 @@ def serve(
     `http` when exposing Nomad over the network.
     """
 
-    transport = _normalize_serve_transport(transport)
-    numeric_level = parse_log_level(log_level)
-    configure_root_logging(stderr_level=numeric_level, log_file=log_file)
-    LOGGER.setLevel(numeric_level)
-    try:
-        config: ServerConfig = ServerConfig.from_file(config)
-    except ConfigError as exc:
-        raise click.ClickException(f"Failed to load config: {exc}") from exc
-    telemetry = getattr(config, "telemetry", None)
-    configure_otel(
-        service_name=getattr(telemetry, "service_name", "nomad"),
-        service_version=_PACKAGE_VERSION,
-        enabled=getattr(telemetry, "enabled", None),
-        otlp_endpoint=getattr(telemetry, "otlp_endpoint", None),
-    )
+    import asyncio
 
     manager_cfg = config.tool_manager
 
@@ -314,6 +487,108 @@ def serve(
             asyncio.run(close_manager())
         shutdown_otel()
 
+    # Capture parameters to avoid closure issues
+    _config_path = config
+    _log_level = log_level
+    _transport = transport
+    _use_tool_manager = use_tool_manager
+    _host = host
+    _port = port
+    _log_file = log_file
+    _strict = strict
+    _watch = watch
+    _watch_interval = watch_interval
+
+    async def _async_serve():
+        transport = _normalize_serve_transport(_transport)
+        numeric_level = parse_log_level(_log_level)
+        configure_root_logging(stderr_level=numeric_level, log_file=_log_file)
+        LOGGER.setLevel(numeric_level)
+        try:
+            config: ServerConfig = ServerConfig.from_file(_config_path)
+        except ConfigError as exc:
+            raise click.ClickException(f"Failed to load config: {exc}") from exc
+        telemetry = getattr(config, "telemetry", None)
+        configure_otel(
+            service_name=getattr(telemetry, "service_name", "nomad"),
+            service_version=_PACKAGE_VERSION,
+            enabled=getattr(telemetry, "enabled", None),
+            otlp_endpoint=getattr(telemetry, "otlp_endpoint", None),
+        )
+
+        server = FastMCP("nomad", on_duplicate="warn")
+        card_locator = ModelCardLocator()
+        register_model_card_tool(server, card_locator)
+
+        manager_cfg = config.tool_manager
+        use_manager = _use_tool_manager and manager_cfg.enabled
+
+        if not manager_cfg.enabled and _use_tool_manager:
+            LOGGER.info("Tool manager disabled by configuration")
+
+        manager = manager_cfg.instantiate() if use_manager else None
+        LOGGER.info("Visible devices: %s", _format_visible_devices(manager))
+
+        # Register initial tools
+        _register_tools(config, server, manager, card_locator, _strict, config.context_dir)
+
+        if config.search_tool.expose:
+            register_search_tool(server, search_config=config.search_tool)
+
+        # Set up hot-swapping if requested
+        watch_task = None
+        manager_ref = [manager]  # Mutable reference for _watch_config
+        if _watch:
+            watch_task = asyncio.create_task(
+                _watch_config(
+                    config_path=_config_path,
+                    server=server,
+                    manager_ref=manager_ref,
+                    card_locator=card_locator,
+                    use_tool_manager=_use_tool_manager,
+                    strict=_strict,
+                    interval=_watch_interval,
+                )
+            )
+
+        try:
+            run_kwargs: dict[str, Any] = {
+                "log_level": _log_level,
+                "show_banner": False,
+            }
+            if transport != "stdio":
+                run_kwargs.update(
+                    {
+                        "host": _host,
+                        "port": _port,
+                        "stateless_http": True,
+                    }
+                )
+
+            # Use run_async if available, otherwise run in thread
+            if hasattr(server, "run_async"):
+                await server.run_async(transport=transport, **run_kwargs)
+            else:
+                import concurrent.futures
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: server.run(transport=transport, **run_kwargs),
+                )
+        finally:
+            if watch_task:
+                watch_task.cancel()
+                try:
+                    await watch_task
+                except asyncio.CancelledError:
+                    pass
+            if manager_ref[0]:
+                await manager_ref[0].aclose()
+            shutdown_otel()
+
+    asyncio.run(_async_serve())
+
 
 class CmxCommand(TyperCommand):
     def collect_usage_pieces(self, ctx: click.Context) -> list[str]:
@@ -395,12 +670,16 @@ def code_mode_exec(
     gateway process. Arguments after ``--`` are forwarded to the `SCRIPT`.
     """
 
-    result = run_code_mode_script(
-        config_path=config,
-        script_path=script,
-        gateway_log_level=gateway_log_level,
-        directory=directory,
-        script_args=list(ctx.args),
+    import asyncio
+
+    result = asyncio.run(
+        run_code_mode_script(
+            config_path=config,
+            script_path=script,
+            gateway_log_level=gateway_log_level,
+            directory=directory,
+            script_args=list(ctx.args),
+        )
     )
     payload = json.dumps(result, indent=2)
 

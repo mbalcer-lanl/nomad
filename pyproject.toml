@@ -20,6 +20,7 @@ dependencies = [
     "oras>=0.2.42,<1.0",
     "thefuzz[speedup]>=0.22.1",
     "requests>=2.32.2",
+    "fno-darcy-nomad",
 ]
 
 [project.optional-dependencies]
@@ -96,3 +97,6 @@ select = [
 
 [tool.uv.pip]
 torch-backend = "auto"
+
+[tool.uv.sources]
+fno-darcy-nomad = { path = "/vast/home/mbalcer/git/nomad_fork/fno-darcy-nomad", editable = true }

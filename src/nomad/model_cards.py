@@ -95,6 +95,10 @@ class ModelCardLocator:
         )
         return [normalized_to_name[match] for match, score in matches if score >= 60]
 
+    def unregister(self, tool_name: str) -> None:
+        """Remove a tool from the locator."""
+        self._sources.pop(tool_name, None)
+
 
 def register_model_card_tool(server: FastMCP, locator: ModelCardLocator) -> None:
     """Register the built-in model card retrieval tool with the server."""

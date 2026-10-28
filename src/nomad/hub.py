@@ -453,8 +453,12 @@ class RepoSpec:
             if cls._looks_like_scp_url(parts.path):
                 normalized = cls._normalize_scp_url(parts.path)
             else:
+                # Check if the original spec is an absolute path (starts with / or ~)
+                is_absolute_spec = parts.path.startswith("/") or parts.path.startswith("~")
                 local_path = cls._resolve_local_path(parts.path, base_dir=base_dir)
-                if local_path.exists():
+                # If spec is absolute path, treat as local file even if it doesn't exist yet.
+                # Relative paths that don't exist are treated as HF repo IDs.
+                if is_absolute_spec or local_path.exists():
                     normalized = local_path.as_uri()
                 else:
                     normalized = f"hf://{parts.path}"
