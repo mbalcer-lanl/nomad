@@ -221,6 +221,9 @@ class ToolConfig(BaseModel):
 class ToolManagerConfig(BaseModel):
     """Configuration for the Torch model tool manager."""
 
+    enabled: bool = Field(default=True)
+    """Enable the tool manager for batching and shared accelerator scheduling."""
+
     idle_seconds: float | None = Field(default=300.0, ge=0)
     """Idle seconds before reducing a tool's device allocation by one slot. ``None`` disables device-slot idle eviction."""
 
